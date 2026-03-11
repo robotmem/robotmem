@@ -1,30 +1,27 @@
-"""robotmem FetchPush 快速 Demo — 5 分钟验证记忆驱动决策
+"""robotmem FetchPush 快速 Demo — SDK 版
 
 运行方式:
   cd examples/fetch_push
   pip install gymnasium-robotics  # 需要 MuJoCo
   PYTHONPATH=../../src python demo.py
+  PYTHONPATH=../../src python demo.py --seed 42
 
-三阶段（各 30 episodes）:
+三阶段（默认各 100 episodes）:
   Phase A: 基线（heuristic，无记忆）
-  Phase B: 记忆写入（learn + save_perception）
-  Phase C: 记忆利用（recall → MemoryPolicy）
+  Phase B: 记忆写入（learn）
+  Phase C: 记忆利用（recall → PhaseAwareMemoryPolicy）
 
-预期结果: Phase C 成功率比 Phase A 高 10-20%
+注: 本示例为 API 用法教程。严格实验请参考 experiment.py（300 episodes, 10 seeds）。
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
+import argparse
 import os
+import random
+import shutil
 import sys
 import time
-
-# 数据隔离 — 必须在 import robotmem 之前设置
-_DEMO_HOME = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".robotmem-demo")
-os.environ["ROBOTMEM_HOME"] = _DEMO_HOME
-os.makedirs(_DEMO_HOME, exist_ok=True)
 
 try:
     import gymnasium_robotics  # noqa: F401
@@ -34,25 +31,21 @@ except ImportError:
     print("需要安装: pip install gymnasium-robotics")
     sys.exit(1)
 
-from robotmem.config import load_config
-from robotmem.db_cog import CogDatabase
-from robotmem.embed import create_embedder
-from robotmem.search import recall as do_recall
-from robotmem.db import floats_to_blob
-from robotmem.ops.memories import insert_memory
-from robotmem.ops.sessions import get_or_create_session, mark_session_ended
-from robotmem.auto_classify import classify_category, estimate_confidence
+from robotmem.sdk import RobotMemory
 
-from policies import HeuristicPolicy, MemoryPolicy
+from policies import HeuristicPolicy, PhaseAwareMemoryPolicy
+
+# 数据隔离
+DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".robotmem-demo")
+DB_PATH = os.path.join(DB_DIR, "memory.db")
 
 COLLECTION = "demo"
-EPISODES = 30  # 每阶段 30 episodes（快速验证）
 MEMORY_WEIGHT = 0.3
 RECALL_N = 5
 
 
 def build_context(obs, actions, success, steps, total_reward):
-    """构建 context JSON"""
+    """构建 context dict — 四区域结构（params/spatial/task）"""
     recent = actions[-10:] if len(actions) >= 10 else actions
     avg_action = np.mean(recent, axis=0) if recent else np.zeros(4)
     return {
@@ -78,22 +71,19 @@ def build_context(obs, actions, success, steps, total_reward):
     }
 
 
-async def run_episode(env, policy, phase, ep, db, embedder):
+def run_episode(env, policy, phase, mem, session_id=None):
     """执行单个 episode"""
-    ext_id = f"demo_{phase}_{ep:03d}"
-    get_or_create_session(db.conn, ext_id, COLLECTION)
-
     # Phase C: recall 成功经验
     recalled = []
     if phase == "C":
-        result = await do_recall(
+        recalled = mem.recall(
             "push cube to target position",
-            db, embedder, collection=COLLECTION, top_k=RECALL_N,
+            n=RECALL_N,
             context_filter={"task.success": True},
         )
-        recalled = result.memories
 
-    active_policy = MemoryPolicy(policy, recalled, MEMORY_WEIGHT) if recalled else policy
+    # PhaseAwareMemoryPolicy: 只在推送阶段施加 bias（避免干扰升高/绕后/下降）
+    active_policy = PhaseAwareMemoryPolicy(policy, recalled, MEMORY_WEIGHT) if recalled else policy
 
     # 跑 episode
     obs, _ = env.reset()
@@ -109,85 +99,101 @@ async def run_episode(env, policy, phase, ep, db, embedder):
 
     success = info.get("is_success", False)
 
-    # Phase B/C: 写记忆
+    # Phase B/C: learn 经验
     if phase in ("B", "C"):
         ctx = build_context(obs, actions, success, len(actions), total_reward)
-        ctx_str = json.dumps(ctx, ensure_ascii=False)
         dist = ctx["params"]["final_distance"]["value"]
+        mem.learn(
+            insight=f"FetchPush: {'成功' if success else '失败'}, 距离 {dist:.3f}m, {len(actions)} 步",
+            context=ctx,
+            session_id=session_id,
+        )
 
-        content = f"FetchPush: {'成功' if success else '失败'}, 距离 {dist:.3f}m, {len(actions)} 步"
-        emb = await embedder.embed_one(content)
-        insert_memory(db.conn, {
-            "content": content, "context": ctx_str, "collection": COLLECTION,
-            "session_id": ext_id, "type": "fact",
-            "category": classify_category(content),
-            "confidence": estimate_confidence(content),
-            "embedding": floats_to_blob(emb),
-        }, vec_loaded=db.vec_loaded)
-
-    mark_session_ended(db.conn, ext_id)
     return success
 
 
-async def run_phase(env, policy, phase, db, embedder):
+def run_phase(env, policy, phase, mem, episodes, session_id=None):
     """执行一个 Phase"""
     successes = 0
-    for ep in range(EPISODES):
-        ok = await run_episode(env, policy, phase, ep, db, embedder)
+    for ep in range(episodes):
+        ok = run_episode(env, policy, phase, mem, session_id)
         successes += int(ok)
         if (ep + 1) % 10 == 0:
-            print(f"  Phase {phase} [{ep+1}/{EPISODES}] 成功率: {successes/(ep+1):.0%}")
-    return successes / EPISODES
+            print(f"  Phase {phase} [{ep+1}/{episodes}] 成功率: {successes/(ep+1):.0%}")
+    return successes / episodes
 
 
-async def main():
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="robotmem FetchPush Demo — 记忆驱动推送（SDK 版）",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="随机种子（可复现运行）")
+    parser.add_argument("--episodes", type=int, default=100, help="每阶段 episode 数（默认 100）")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # 设置随机种子
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+
+    episodes = args.episodes
+
+    # 清空旧数据
+    if os.path.exists(DB_DIR):
+        shutil.rmtree(DB_DIR)
+    os.makedirs(DB_DIR, exist_ok=True)
+
     print("=" * 50)
-    print("robotmem FetchPush Demo")
-    print(f"每阶段 {EPISODES} episodes，约 2-3 分钟")
+    print("robotmem FetchPush Demo (SDK)")
+    print(f"每阶段 {episodes} episodes")
+    if args.seed is not None:
+        print(f"随机种子: {args.seed}")
+    print(f"DB: {DB_PATH}")
     print("=" * 50)
 
-    config = load_config()
-    db = CogDatabase(config)
-    embedder = create_embedder(config)
-    if not await embedder.check_availability():
-        print(f"Embedder 不可用: {embedder.unavailable_reason}")
-        return
-
+    mem = RobotMemory(db_path=DB_PATH, collection=COLLECTION, embed_backend="onnx")
     env = gymnasium.make("FetchPush-v4")
     policy = HeuristicPolicy()
 
-    # Phase A
-    print(f"\n--- Phase A: 基线（无记忆）---")
     t0 = time.time()
-    rate_a = await run_phase(env, policy, "A", db, embedder)
 
-    # Phase B
-    print(f"\n--- Phase B: 写入记忆 ---")
-    rate_b = await run_phase(env, policy, "B", db, embedder)
+    try:
+        # Phase A: 基线（无记忆）
+        print("\n--- Phase A: 基线（无记忆）---")
+        rate_a = run_phase(env, policy, "A", mem, episodes)
 
-    # Phase C
-    print(f"\n--- Phase C: 利用记忆 ---")
-    rate_c = await run_phase(env, policy, "C", db, embedder)
-    elapsed = time.time() - t0
+        # Phase B+C: 记忆写入 + 利用（同一 session）
+        with mem.session(context={"task": "push_to_target", "env": "FetchPush-v4"}) as sid:
+            print("\n--- Phase B: 写入记忆 ---")
+            rate_b = run_phase(env, policy, "B", mem, episodes, sid)
 
-    # 结果
-    delta = rate_c - rate_a
-    verdict = "失败" if delta <= 0 else "微弱" if delta <= 0.05 else "有效" if delta <= 0.15 else "显著"
+            print("\n--- Phase C: 利用记忆 ---")
+            rate_c = run_phase(env, policy, "C", mem, episodes, sid)
 
-    print(f"\n{'=' * 50}")
-    print(f"结果")
-    print(f"{'=' * 50}")
-    print(f"  Phase A: {rate_a:.0%}")
-    print(f"  Phase B: {rate_b:.0%}")
-    print(f"  Phase C: {rate_c:.0%}")
-    print(f"  提升:    {delta:+.0%} ({verdict})")
-    print(f"  耗时:    {elapsed:.0f}s")
-    print(f"\n数据存储于: {_DEMO_HOME}")
+        elapsed = time.time() - t0
 
-    env.close()
-    await embedder.close()
-    db.close()
+        # 结果
+        delta = rate_c - rate_a
+
+        print(f"\n{'=' * 50}")
+        print("演示结果")
+        print(f"{'=' * 50}")
+        print(f"  Phase A: {rate_a:.0%}")
+        print(f"  Phase B: {rate_b:.0%}")
+        print(f"  Phase C: {rate_c:.0%}")
+        print(f"  提升 (C - A): {delta:+.0%}")
+        print(f"  耗时: {elapsed:.0f}s")
+        print(f"\n  注: 本示例演示 recall → PhaseAwareMemoryPolicy 的 API 用法。")
+        print(f"  严格实验请参考 experiment.py（300 episodes, 10 seeds）。")
+        print(f"\n数据存储于: {DB_DIR}")
+    finally:
+        env.close()
+        mem.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

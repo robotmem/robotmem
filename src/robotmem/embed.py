@@ -34,6 +34,12 @@ class Embedder(Protocol):
         self, texts: list[str], batch_size: int = 32
     ) -> list[list[float] | None]: ...
 
+    def embed_one_sync(self, text: str) -> list[float]: ...
+
+    def embed_batch_sync(
+        self, texts: list[str], batch_size: int = 32
+    ) -> list[list[float] | None]: ...
+
     async def check_availability(self) -> bool: ...
 
     async def close(self) -> None: ...
@@ -224,6 +230,63 @@ class OllamaEmbedder:
                 all_embeddings.extend([None] * len(batches[i]))
             else:
                 all_embeddings.extend(result)
+        return all_embeddings
+
+    # ── sync 桥接（SDK 用）──
+
+    def embed_one_sync(self, text: str) -> list[float]:
+        """单条文本 → 向量（同步，SDK 用）
+
+        使用 httpx.Client 同步发请求，避免 asyncio event loop 冲突。
+        """
+        import httpx
+
+        with httpx.Client(
+            base_url=self._ollama_url,
+            timeout=httpx.Timeout(connect=3.0, read=10.0, write=10.0, pool=10.0),
+        ) as client:
+            last_exc: Exception | None = None
+            for attempt in range(self._MAX_RETRIES):
+                try:
+                    resp = client.post(self._embed_endpoint(), json=self._embed_payload(text))
+                    resp.raise_for_status()
+                    return self._parse_embeddings(resp.json())[0]
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    last_exc = e
+                    import time
+                    wait = self._BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("embed_one_sync 失败 (%d/%d): %s", attempt + 1, self._MAX_RETRIES, e)
+                    time.sleep(wait)
+                except httpx.HTTPStatusError:
+                    raise
+                except (KeyError, IndexError) as e:
+                    raise ValueError(f"embed 响应格式错误: {e}") from e
+            if last_exc:
+                raise last_exc
+            raise RuntimeError("重试循环结束但无异常")
+
+    def embed_batch_sync(
+        self, texts: list[str], batch_size: int = 32
+    ) -> list[list[float] | None]:
+        """批量文本 → 向量列表（同步，SDK 用）"""
+        if not texts:
+            return []
+        import httpx
+
+        all_embeddings: list[list[float] | None] = []
+        with httpx.Client(
+            base_url=self._ollama_url,
+            timeout=httpx.Timeout(connect=3.0, read=10.0, write=10.0, pool=10.0),
+        ) as client:
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                try:
+                    resp = client.post(self._embed_endpoint(), json=self._embed_payload(batch))
+                    resp.raise_for_status()
+                    all_embeddings.extend(self._parse_embeddings(resp.json()))
+                except Exception as e:
+                    logger.warning("embed_batch_sync 第 %d 批失败: %s", i // batch_size, e)
+                    all_embeddings.extend([None] * len(batch))
         return all_embeddings
 
     # ── 可用性检测（合并 ollama_check.py）──

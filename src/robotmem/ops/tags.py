@@ -1,5 +1,6 @@
 """标签领域 — memory_tags CRUD
 
+从 index1 精简：去掉 symbol_link / centroid / rename / tag_tree 等。
 每个函数接收 conn: sqlite3.Connection 作为第一参数。
 """
 

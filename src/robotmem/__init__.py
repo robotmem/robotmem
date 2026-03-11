@@ -25,8 +25,20 @@ from .api import (
     start_session,
     update,
 )
+from .exceptions import (
+    DatabaseError,
+    EmbeddingError,
+    RobotMemError,
+    ValidationError,
+)
+from .sdk import RobotMemory
 
 __all__ = [
+    "RobotMemory",
+    "RobotMemError",
+    "ValidationError",
+    "DatabaseError",
+    "EmbeddingError",
     "save_perception",
     "recall",
     "learn",

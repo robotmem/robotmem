@@ -399,6 +399,90 @@ class TestOllamaEmbedder:
         assert result is False
 
 
+    # ── embed_one_sync 测试 ──
+
+    def test_embed_one_sync_success(self):
+        e = self._make_embedder()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.Client") as MockClient:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_resp
+            MockClient.return_value = mock_client
+
+            result = e.embed_one_sync("test")
+            assert result == [0.1, 0.2, 0.3]
+
+    def test_embed_one_sync_key_error(self):
+        e = self._make_embedder()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"wrong_key": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.Client") as MockClient:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_resp
+            MockClient.return_value = mock_client
+
+            with pytest.raises(ValueError, match="响应格式错误"):
+                e.embed_one_sync("test")
+
+    # ── embed_batch_sync 测试 ──
+
+    def test_embed_batch_sync_empty(self):
+        e = self._make_embedder()
+        result = e.embed_batch_sync([])
+        assert result == []
+
+    def test_embed_batch_sync_success(self):
+        e = self._make_embedder()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"embeddings": [[0.1], [0.2]]}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.Client") as MockClient:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post.return_value = mock_resp
+            MockClient.return_value = mock_client
+
+            result = e.embed_batch_sync(["a", "b"], batch_size=32)
+            assert result == [[0.1], [0.2]]
+
+    def test_embed_batch_sync_partial_failure(self):
+        e = self._make_embedder()
+        good_resp = MagicMock()
+        good_resp.json.return_value = {"embeddings": [[0.1]]}
+        good_resp.raise_for_status = MagicMock()
+
+        call_count = 0
+        def mock_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise Exception("fail")
+            return good_resp
+
+        with patch("httpx.Client") as MockClient:
+            mock_client = MagicMock()
+            mock_client.__enter__ = MagicMock(return_value=mock_client)
+            mock_client.__exit__ = MagicMock(return_value=False)
+            mock_client.post = mock_post
+            MockClient.return_value = mock_client
+
+            result = e.embed_batch_sync(["a", "b"], batch_size=1)
+            assert len(result) == 2
+            assert result[0] is None  # 第一批失败
+            assert result[1] == [0.1]  # 第二批成功
+
+
 # ── create_embedder 工厂测试 ──
 
 class TestCreateEmbedder:
@@ -571,3 +655,54 @@ class TestFastEmbedEmbedder:
         from robotmem.embed_onnx import FastEmbedEmbedder
         e = FastEmbedEmbedder(model="test", dim=4, cache_dir="/tmp/cache")
         assert e._cache_dir == "/tmp/cache"
+
+    # ── embed_one_sync 测试 ──
+
+    def test_embed_one_sync_success(self):
+        import numpy as np
+        e = self._make_embedder()
+        mock_encoder = MagicMock()
+        mock_encoder.embed.return_value = iter([np.array([0.1, 0.2, 0.3, 0.4])])
+        e._encoder = mock_encoder
+
+        result = e.embed_one_sync("test")
+        assert len(result) == 4
+        assert abs(result[0] - 0.1) < 1e-6
+
+    def test_embed_one_sync_failure(self):
+        e = self._make_embedder()
+        mock_encoder = MagicMock()
+        mock_encoder.embed.side_effect = Exception("model error")
+        e._encoder = mock_encoder
+
+        with pytest.raises(RuntimeError, match="ONNX embedding 失败"):
+            e.embed_one_sync("test")
+
+    # ── embed_batch_sync 测试 ──
+
+    def test_embed_batch_sync_empty(self):
+        e = self._make_embedder()
+        result = e.embed_batch_sync([])
+        assert result == []
+
+    def test_embed_batch_sync_success(self):
+        import numpy as np
+        e = self._make_embedder()
+        mock_encoder = MagicMock()
+        mock_encoder.embed.return_value = iter([
+            np.array([0.1, 0.2, 0.3, 0.4]),
+            np.array([0.5, 0.6, 0.7, 0.8]),
+        ])
+        e._encoder = mock_encoder
+
+        result = e.embed_batch_sync(["a", "b"])
+        assert len(result) == 2
+
+    def test_embed_batch_sync_failure(self):
+        e = self._make_embedder()
+        mock_encoder = MagicMock()
+        mock_encoder.embed.side_effect = Exception("fail")
+        e._encoder = mock_encoder
+
+        result = e.embed_batch_sync(["a", "b"])
+        assert result == [None, None]

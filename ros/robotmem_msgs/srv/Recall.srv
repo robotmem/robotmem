@@ -1,0 +1,12 @@
+string query                    # 必填
+int32 n                         # 默认 5
+float64 min_confidence          # 默认 0.3
+string session_id               # 选填
+string context_filter           # 选填，JSON
+string spatial_sort             # 选填，JSON
+string collection               # 选填
+---
+robotmem_msgs/Memory[] memories
+int32 total
+string mode                     # "hybrid" / "bm25_only"
+string error

@@ -53,6 +53,34 @@ class FastEmbedEmbedder:
                 self._unavailable_reason = f"FastEmbed 模型加载失败: {e}"
                 raise
 
+    # ── sync 方法（SDK 用，原生同步，不需要 asyncio 桥接）──
+
+    def embed_one_sync(self, text: str) -> list[float]:
+        """单条文本 → 向量（同步，SDK 用）"""
+        self._ensure_encoder()
+        try:
+            embeddings = list(self._encoder.embed([text]))
+            return embeddings[0].tolist()
+        except Exception as e:
+            logger.error("FastEmbed embed_one_sync 失败: %s", e)
+            raise RuntimeError("ONNX embedding 失败") from e
+
+    def embed_batch_sync(
+        self, texts: list[str], batch_size: int = 32
+    ) -> list[list[float] | None]:
+        """批量文本 → 向量列表（同步，SDK 用）"""
+        if not texts:
+            return []
+        try:
+            self._ensure_encoder()
+            embeddings = list(self._encoder.embed(texts, batch_size=batch_size))
+            return [e.tolist() for e in embeddings]
+        except Exception as e:
+            logger.warning("FastEmbed embed_batch_sync 失败: %s，返回 None 填充", e)
+            return [None] * len(texts)
+
+    # ── async 方法（MCP Server 用）──
+
     async def embed_one(self, text: str) -> list[float]:
         """单条文本 → 向量"""
         import asyncio

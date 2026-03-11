@@ -1,7 +1,9 @@
 """认知搜索 — recall 入口
 
-BM25 + Vec + RRF merge + confidence 过滤。
-支持 session_id 过滤、source_weight、perception_type 返回。
+替代 index1 search_cog.py 的 200+ 行：
+- 去掉：resolution routing / surprise boost / pearl / domain / bundles / models
+- 保留：BM25 + Vec + RRF merge + confidence 过滤
+- 新增（产品架构圆桌）：session_id 过滤、_apply_source_weight、perception_type 返回
 """
 
 from __future__ import annotations
@@ -145,62 +147,20 @@ def _compute_spatial_distance(mem: dict, field: str, target: list[float]) -> flo
     return sum((a - t) ** 2 for a, t in zip(actual, target)) ** 0.5
 
 
-async def recall(
+def _recall_impl(
     query: str,
     db: CogDatabase,
-    embedder: Embedder | None = None,
-    collection: str = "default",
-    top_k: int = 5,
-    min_confidence: float = 0.3,
-    session_id: str | None = None,
-    context_filter: dict | None = None,
-    spatial_sort: dict | None = None,
+    bm25_results: list[dict],
+    vec_results: list[dict],
+    collection: str,
+    top_k: int,
+    min_confidence: float,
+    session_id: str | None,
+    context_filter: dict | None,
+    spatial_sort: dict | None,
+    t0: float,
 ) -> RecallResult:
-    """认知搜索主入口 — BM25 + Vec + RRF
-
-    三层防御：
-    - L1 事前：query 非空 + top_k 范围
-    - L2 事中：try-except 搜索异常不崩溃
-    - L3 事后：touch 更新访问计数 + 日志
-
-    Args:
-        session_id: episode 回放过滤（Abbeel 产品架构 Round 2）
-        context_filter: 结构化过滤（#17 P1），如 {"task.success": True}
-        spatial_sort: 空间近邻排序（#17 P2），如
-            {"field": "spatial.object_position", "target": [1.3, 0.7, 0.42]}
-    """
-    t0 = time.monotonic()
-
-    # L1: 事前校验
-    if not query or not query.strip():
-        return RecallResult()
-    top_k = min(max(1, top_k), 100)
-    session_id = session_id or None  # 空字符串统一为 None
-
-    # 有过滤/排序时多取候选，补偿过滤损耗
-    fetch_mul = 4 if (context_filter or spatial_sort) else 2
-    fetch_limit = top_k * fetch_mul
-
-    # L2: BM25 搜索（每次通过 db.conn 获取连接，避免缓存旧连接）
-    try:
-        bm25_results = fts_search_memories(db.conn, query, collection, limit=fetch_limit)
-    except Exception as e:
-        logger.warning("recall BM25 搜索异常: %s", e)
-        bm25_results = []
-
-    # L2: Vec 搜索（embedder 可用时）
-    vec_results: list[dict] = []
-    if embedder and embedder.available:
-        try:
-            embedding = await embedder.embed_one(query)
-            vec_results = vec_search_memories(
-                db.conn, embedding, collection, limit=fetch_limit, vec_loaded=db.vec_loaded,
-            )
-        except Exception as e:
-            logger.warning("recall Vec 搜索异常: %s", e)
-    elif embedder:
-        logger.debug("recall: embedder 不可用 (%s)，降级为 BM25-only", embedder.unavailable_reason)
-
+    """recall 核心逻辑 — 纯 sync，被 recall() 和 recall_sync() 共用"""
     if not bm25_results and not vec_results:
         return RecallResult(query_ms=(time.monotonic() - t0) * 1000)
 
@@ -219,7 +179,7 @@ async def recall(
     _apply_source_weight(merged)
     merged.sort(key=lambda x: x.get("_rrf_score", 0), reverse=True)
 
-    # 基础过滤：confidence + session_id（不限 top_k，后续还有 context/spatial 过滤）
+    # 基础过滤：confidence + session_id
     candidates = []
     for m in merged:
         if m.get("confidence", 0) < min_confidence:
@@ -278,4 +238,121 @@ async def recall(
         total=len(filtered),
         mode=mode,
         query_ms=query_ms,
+    )
+
+
+def _prepare_recall(
+    query: str,
+    top_k: int,
+    session_id: str | None,
+    context_filter: dict | None,
+    spatial_sort: dict | None,
+) -> tuple[int, str | None, int]:
+    """recall 公共前处理 — L1 校验 + fetch_limit 计算"""
+    top_k = min(max(1, top_k), 100)
+    session_id = session_id or None
+    fetch_mul = 4 if (context_filter or spatial_sort) else 2
+    return top_k, session_id, top_k * fetch_mul
+
+
+async def recall(
+    query: str,
+    db: CogDatabase,
+    embedder: Embedder | None = None,
+    collection: str = "default",
+    top_k: int = 5,
+    min_confidence: float = 0.3,
+    session_id: str | None = None,
+    context_filter: dict | None = None,
+    spatial_sort: dict | None = None,
+) -> RecallResult:
+    """认知搜索主入口（async，MCP Server 用）
+
+    三层防御：
+    - L1 事前：query 非空 + top_k 范围
+    - L2 事中：try-except 搜索异常不崩溃
+    - L3 事后：touch 更新访问计数 + 日志
+    """
+    t0 = time.monotonic()
+
+    if not query or not query.strip():
+        return RecallResult()
+
+    top_k, session_id, fetch_limit = _prepare_recall(
+        query, top_k, session_id, context_filter, spatial_sort,
+    )
+
+    # L2: BM25 搜索
+    try:
+        bm25_results = fts_search_memories(db.conn, query, collection, limit=fetch_limit)
+    except Exception as e:
+        logger.warning("recall BM25 搜索异常: %s", e)
+        bm25_results = []
+
+    # L2: Vec 搜索（async embed）
+    vec_results: list[dict] = []
+    if embedder and embedder.available:
+        try:
+            embedding = await embedder.embed_one(query)
+            vec_results = vec_search_memories(
+                db.conn, embedding, collection, limit=fetch_limit, vec_loaded=db.vec_loaded,
+            )
+        except Exception as e:
+            logger.warning("recall Vec 搜索异常: %s", e)
+    elif embedder:
+        logger.debug("recall: embedder 不可用 (%s)，降级为 BM25-only", embedder.unavailable_reason)
+
+    return _recall_impl(
+        query, db, bm25_results, vec_results, collection,
+        top_k, min_confidence, session_id, context_filter, spatial_sort, t0,
+    )
+
+
+def recall_sync(
+    query: str,
+    db: CogDatabase,
+    embedder: Embedder | None = None,
+    collection: str = "default",
+    top_k: int = 5,
+    min_confidence: float = 0.3,
+    session_id: str | None = None,
+    context_filter: dict | None = None,
+    spatial_sort: dict | None = None,
+) -> RecallResult:
+    """认知搜索主入口（sync，SDK 用）
+
+    与 recall() 逻辑完全一致，区别仅在 embedding 用 embed_one_sync()。
+    """
+    t0 = time.monotonic()
+
+    if not query or not query.strip():
+        return RecallResult()
+
+    top_k, session_id, fetch_limit = _prepare_recall(
+        query, top_k, session_id, context_filter, spatial_sort,
+    )
+
+    # L2: BM25 搜索
+    try:
+        bm25_results = fts_search_memories(db.conn, query, collection, limit=fetch_limit)
+    except Exception as e:
+        logger.warning("recall_sync BM25 搜索异常: %s", e)
+        bm25_results = []
+
+    # L2: Vec 搜索（sync embed）
+    vec_results: list[dict] = []
+    if embedder and embedder.available:
+        try:
+            embedding = embedder.embed_one_sync(query)
+            vec_results = vec_search_memories(
+                db.conn, embedding, collection, limit=fetch_limit, vec_loaded=db.vec_loaded,
+            )
+        except Exception as e:
+            logger.warning("recall_sync Vec 搜索异常: %s", e)
+    elif embedder:
+        logger.debug("recall_sync: embedder 不可用 (%s)，降级为 BM25-only", embedder.unavailable_reason)
+
+    return _recall_impl(
+        query, db, bm25_results, vec_results, collection,
+        top_k, min_confidence, session_id, context_filter, spatial_sort, t0,
     )

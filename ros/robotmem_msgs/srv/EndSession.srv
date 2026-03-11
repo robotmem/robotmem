@@ -1,0 +1,10 @@
+string session_id               # 必填
+bool has_outcome_score          # true = outcome_score 有效
+float64 outcome_score           # 仅在 has_outcome_score=true 时有效
+---
+bool success
+string summary_json             # JSON: session summary
+int32 decayed_count
+string consolidated_json        # JSON: {merged_groups, superseded_count}
+robotmem_msgs/Memory[] related_memories
+string error

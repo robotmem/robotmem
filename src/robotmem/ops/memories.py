@@ -1,5 +1,6 @@
 """记忆领域 — 统一 memories 表 CRUD + FTS5/vec0 同步
 
+合并 index1 的 facts + perceptions 到单一 memories 表。
 type='fact' = declarative memory（命题记忆）
 type='perception' = procedural memory（程序性记忆）
 

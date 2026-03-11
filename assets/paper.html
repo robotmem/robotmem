@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>robotmem: Persistent Episodic Memory for Robot Reinforcement Learning</title>
+<style>
+@page {
+    size: A4;
+    margin: 2.5cm 2cm;
+}
+body {
+    font-family: "Palatino", "Palatino Linotype", "Charter", Georgia, serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    color: #111;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
+}
+h1 {
+    font-size: 18pt;
+    text-align: center;
+    margin-bottom: 0.3em;
+    line-height: 1.3;
+}
+/* 作者信息居中 */
+h1 + p, h1 + p + p, h1 + p + p + p {
+    text-align: center;
+}
+h2 {
+    font-size: 13pt;
+    margin-top: 1.5em;
+    margin-bottom: 0.5em;
+    border-bottom: none;
+}
+h3 {
+    font-size: 11pt;
+    margin-top: 1.2em;
+    margin-bottom: 0.4em;
+}
+p {
+    margin: 0.5em 0;
+    text-align: justify;
+}
+hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin: 1.5em 0;
+}
+table {
+    border-collapse: collapse;
+    margin: 1em auto;
+    font-size: 10pt;
+    width: auto;
+}
+th, td {
+    border: 1px solid #999;
+    padding: 4px 10px;
+    text-align: left;
+}
+th {
+    background: #f0f0f0;
+    font-weight: bold;
+}
+ul, ol {
+    margin: 0.5em 0;
+    padding-left: 2em;
+}
+li {
+    margin: 0.2em 0;
+}
+code {
+    font-family: "Courier New", monospace;
+    font-size: 10pt;
+    background: #f5f5f5;
+    padding: 1px 3px;
+    border-radius: 2px;
+}
+em {
+    font-style: italic;
+}
+strong {
+    font-weight: bold;
+}
+a {
+    color: #1a0dab;
+    text-decoration: none;
+}
+/* 隐藏第一个 hr（标题下方的分隔线） */
+hr:first-of-type {
+    display: none;
+}
+</style>
+</head>
+<body>
+<h1>robotmem: Persistent Episodic Memory for Robot Learning</h1>
+<p><strong>Charles Jia</strong></p>
+<p>robotmem.com | founder@robotmem.com</p>
+<p>ORCID: 0009-0005-3749-9786</p>
+<hr />
+<h2>Abstract</h2>
+<p>Robot learning agents discard accumulated experience after each training episode, preventing knowledge transfer across episodes and environments. We present robotmem, an open-source episodic memory system that provides persistent, queryable experience storage for robot learning. robotmem stores physical experiences as natural language descriptions with structured metadata, enabling hybrid retrieval through full-text search, vector similarity, and spatial sorting via Reciprocal Rank Fusion. In multi-seed experiments on MuJoCo FetchPush-v4, a memory-augmented heuristic policy improves success rate by +8.8 percentage points over baseline (5 seeds, paired t(4) = 3.96, p = 0.017, Cohen's d = 1.77). Cross-environment transfer from FetchPush to FetchSlide yields +9.2pp improvement (5 seeds, t(4) = 4.76, p = 0.009), demonstrating that natural-language-stored experiences can transfer across tasks with different dynamics. An ablation study reveals that recalled experiences benefit the full trajectory, not just the execution phase. robotmem is model-agnostic, requires no external services, and integrates via Model Context Protocol (MCP) or direct Python API.</p>
+<p><strong>Keywords:</strong> episodic memory, robot learning, experience transfer, persistent memory, retrieval-augmented policy</p>
+<p><strong>Software:</strong> https://github.com/robotmem/robotmem</p>
+<p><strong>DOI (software archive):</strong> 10.5281/zenodo.18925678</p>
+<hr />
+<h2>1. Introduction</h2>
+<p>A fundamental limitation of standard reinforcement learning is episodic amnesia: agents treat each training episode as isolated, discarding accumulated experience when training ends. Experience replay buffers [1] mitigate this within a single training run, and Hindsight Experience Replay (HER) [9] further enables learning from failed trajectories in multi-goal settings. However, these techniques offer no persistence across training runs and no queryable interface for retrieving past experiences by content or spatial context.</p>
+<p>Transfer learning approaches — including progressive neural networks [10], policy distillation [11], and sim-to-real methods — address cross-environment knowledge reuse but operate at the policy level, transferring learned parameters rather than discrete experiences. Retrieval-augmented generation (RAG), widely successful in NLP [12], has not been systematically applied to robot learning as an experience retrieval mechanism.</p>
+<p>This limitation is particularly costly in robotics, where physical interaction data is expensive to collect. A robot that has learned to push objects with optimal force and angle must relearn these physical parameters from scratch in every new training session. Human learning, by contrast, accumulates experience across episodes — a cook who burned a dish yesterday adjusts the temperature today.</p>
+<p>Recent work has recognized the importance of memory in robot learning. MemoryVLA [2] augments vision-language-action models with memory modules, MemER [3] introduces memory-enhanced robot learning, and EchoVLA [4] echoes past experiences to improve policy performance. However, these approaches are typically model-specific, closed-source, or tightly coupled to particular architectures.</p>
+<p>We present robotmem, an open-source episodic memory system designed as a universal infrastructure layer for robot learning. Unlike the above systems, robotmem stores experiences as natural language descriptions — a design choice that enables human inspection, integration with language-model-based agents, and potentially facilitates cross-environment transfer by abstracting over environment-specific details (though our experiments do not yet isolate this factor). Our key contributions are:</p>
+<ol>
+<li><strong>A hybrid retrieval method</strong> for robot experience recall, combining full-text search (FTS5), vector similarity, and spatial sorting via Reciprocal Rank Fusion (RRF), with structured metadata filtering.</li>
+<li><strong>Multi-seed experimental evidence</strong> on MuJoCo FetchPush-v4 that memory-augmented heuristic policies outperform the baseline by +8.8 ± 4.4 percentage points (5 seeds), with ablation showing all-phase blending (65.3%) outperforms push-phase-only (59.0%).</li>
+<li><strong>Cross-environment transfer</strong> from FetchPush to FetchSlide (+9.2 ± 3.9 percentage points, 5 seeds), co-occurring with natural language storage and suggesting — though not yet causally establishing — that language-level abstraction facilitates cross-task transfer.</li>
+<li><strong>An open-source system</strong> (Apache 2.0) with 7 APIs, integrable via MCP or Python SDK, designed as reusable infrastructure for memory-augmented robot learning research.</li>
+</ol>
+<hr />
+<h2>2. System Architecture</h2>
+<h3>2.1 Design Principles</h3>
+<p>robotmem is guided by five design principles:</p>
+<ol>
+<li><strong>Machine-actionable</strong>: Memories store actionable parameters (forces, angles, strategies), not just observations.</li>
+<li><strong>Human-readable</strong>: All memories are stored as natural language, making them inspectable and debuggable. We hypothesize that this abstraction level may facilitate cross-environment transfer by abstracting over environment-specific state representations, though our experiments do not yet isolate this factor (Section 6).</li>
+<li><strong>Minimal complexity</strong>: SQLite-based, no external services, no GPU required.</li>
+<li><strong>Fail-loud</strong>: Memory recall timeout is soft (degraded but functional); memory write failure is hard (must report error).</li>
+<li><strong>Additive extension</strong>: New perception modalities are added without modifying existing code.</li>
+</ol>
+<h3>2.2 Memory Storage</h3>
+<p>Each memory record contains:</p>
+<ul>
+<li><strong>content</strong>: Natural language description of the experience (e.g., "Approaching from 15° left with 12N force succeeds for centered objects")</li>
+<li><strong>context</strong>: Structured JSON with four sections:</li>
+<li><code>params</code>: Physical parameters (approach velocity, grip force, final distance to target)</li>
+<li><code>spatial</code>: Spatial coordinates (grip position, object position, target position, scene tag)</li>
+<li><code>robot</code>: Robot metadata (type, end effector, degrees of freedom)</li>
+<li><code>task</code>: Task outcome (name, success, steps, total reward)</li>
+<li><strong>embedding</strong>: Dense vector representation (384 dimensions, FastEmbed ONNX) for semantic search</li>
+<li><strong>type</strong>: <code>fact</code> (learned experience) or <code>perception</code> (raw sensor data reference)</li>
+<li><strong>collection</strong>: Namespace for experiment isolation</li>
+</ul>
+<p>Memories are recorded at episode end: after each episode completes, the system computes episode-level statistics (average approach velocity, final object-target distance, success/failure) and stores both a natural language summary and the structured context. This episode-level granularity trades step-level detail for storage efficiency and retrieval relevance.</p>
+<p><strong>Scope clarification</strong>: robotmem stores episode-level summaries and parameters as natural language + structured JSON. It does not store raw sensory data (images, point clouds, force-torque trajectories); such data should be stored in domain-specific formats (ROS bags, HDF5) and referenced via the <code>perception</code> type field.</p>
+<h3>2.3 Hybrid Retrieval</h3>
+<p>The recall API implements Reciprocal Rank Fusion (RRF) across three retrieval channels. Given a query, each channel produces a ranked list. The fused score for item <em>i</em> is:</p>
+<p><strong>RRF(i) = 1/(k + rank_FTS5(i)) + 1/(k + rank_vec(i)) + 1/(k + rank_spatial(i))</strong></p>
+<p>where rank_c(i) is the rank of item <em>i</em> in channel <em>c</em>, and k = 60 (standard RRF constant [14]). Channels that do not return item <em>i</em> contribute zero to the sum.</p>
+<p>The three channels are:</p>
+<ol>
+<li><strong>FTS5 full-text search</strong>: SQLite FTS5 with jieba tokenization for CJK support. Matches keyword-level queries efficiently.</li>
+<li><strong>Vector similarity</strong>: vec0 extension for cosine similarity search on ONNX-embedded vectors (FastEmbed, 384 dimensions).</li>
+<li><strong>Spatial sorting</strong>: Optional re-ranking by Euclidean distance to a target coordinate, enabling queries like "what worked near position [1.3, 0.7, 0.4]?"</li>
+</ol>
+<p>Additional filtering is supported through <code>context_filter</code>, which parses JSON paths (e.g., <code>{"task.success": true}</code>) to retrieve only successful experiences.</p>
+<h3>2.4 Integration</h3>
+<p>robotmem provides two integration paths:</p>
+<ul>
+<li><strong>MCP Server</strong>: 7 tools exposed via Model Context Protocol, compatible with any MCP-capable AI agent (Claude, GPT, etc.)</li>
+<li><strong>Python SDK</strong>: Direct import for tighter integration in training loops, bypassing MCP overhead.</li>
+</ul>
+<hr />
+<h2>3. Experimental Setup</h2>
+<h3>3.1 Environment</h3>
+<p>We use MuJoCo's FetchPush-v4 [7] via Gymnasium-Robotics [8]: a simulated 7-DOF Fetch robot arm that must push a cube to a target position on a tabletop. The full observation space includes gripper position (3D), gripper linear velocity (3D), object position (3D), object rotational velocity (3D), object-gripper relative position (3D), and object-target relative position (3D). Our heuristic policy uses gripper position, object position, and target position; velocity observations are not used. The action space is 4-dimensional: 3D Cartesian displacement + gripper control. Our policy keeps the gripper open throughout (no grasping), using only the 3D displacement dimensions. An episode succeeds if the object is within 5cm of the target.</p>
+<h3>3.2 Baseline Policy</h3>
+<p>We implement a 4-stage heuristic policy as a proof-of-concept baseline:</p>
+<ol>
+<li><strong>Rise</strong>: Lift gripper above the object (avoid collision during positioning)</li>
+<li><strong>Move behind</strong>: Navigate to a position behind the object (opposite to push direction), offset 4cm from the object center</li>
+<li><strong>Descend</strong>: Lower to object height</li>
+<li><strong>Push</strong>: Apply force toward the target</li>
+</ol>
+<p>We use a heuristic rather than a trained RL policy (e.g., SAC+HER) for two reasons: (1) it provides a deterministic baseline unaffected by exploration noise, isolating the effect of memory augmentation; (2) it allows us to validate the memory system independently of any learning algorithm. We note that HER-trained policies achieve &gt;90% success on FetchPush [9]; our ~52% baseline (mean across 5 seeds) is intentionally weaker, as the goal is to measure the memory system's contribution, not to compete with state-of-the-art RL. Integration with learned policies is future work (Section 6).</p>
+<h3>3.3 Memory-Augmented Policy</h3>
+<p>The memory-augmented policy extends the baseline by:</p>
+<ol>
+<li>At episode start, querying robotmem with the current object and target positions</li>
+<li>Filtering for successful experiences (<code>context_filter={"task.success": true}</code>)</li>
+<li>Sorting results by spatial proximity to the current object position</li>
+<li>Extracting average approach velocity from recalled successful experiences</li>
+<li>Blending the memory bias with the heuristic action: <code>action = (1-w) × base + w × bias</code>, where <code>w=0.3</code></li>
+</ol>
+<p>We evaluate two blending strategies: (a) <strong>push-phase-only</strong> (PhaseAwareMemoryPolicy), applying memory bias only during phase 4 (push), and (b) <strong>all-phase</strong> (MemoryPolicy), applying memory bias during all four phases. Our initial hypothesis was that push-phase-only would be superior, since approach velocities are most relevant during the push. However, ablation results (Section 4.3) show that all-phase blending outperforms push-phase-only, suggesting that recalled experiences also provide beneficial directional information during positioning phases.</p>
+<p>The blending weight <code>w=0.3</code> was selected by manual tuning over values {0.1, 0.2, 0.3, 0.5, 0.7} on a 30-episode validation run; 0.3 yielded the best balance between memory influence and heuristic stability. We acknowledge this is not a rigorous hyperparameter search and note adaptive weighting as future work.</p>
+<h3>3.4 Three-Phase Protocol</h3>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Episodes</th>
+<th>Strategy</th>
+<th>Memory Operations</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td>1-100</td>
+<td>Heuristic baseline</td>
+<td>None</td>
+<td>Baseline performance</td>
+</tr>
+<tr>
+<td>B</td>
+<td>101-200</td>
+<td>Heuristic + memory write</td>
+<td>learn + save_perception</td>
+<td>Write control (populate DB)</td>
+</tr>
+<tr>
+<td>C</td>
+<td>201-300</td>
+<td>Heuristic + memory read/write</td>
+<td>recall + learn</td>
+<td>Memory utilization</td>
+</tr>
+</tbody>
+</table>
+<p>We run 5 independent seeds (fresh database per seed), reporting mean ± standard deviation. Each seed runs all 300 episodes sequentially. This multi-seed protocol ensures that reported improvements are robust to environment randomization rather than artifacts of a single favorable seed.</p>
+<h3>3.5 Cross-Environment Transfer</h3>
+<p>To provide preliminary evidence of cross-environment transfer, we run a separate experiment on FetchSlide-v4, where the robot must slide a puck across a table to reach distant targets. FetchSlide differs from FetchPush in several physical parameters: the puck has lower friction coefficient than the cube, target distances are 2-3x greater, and success requires imparting a precise initial impulse (the puck must slide to the target after contact, unlike push where continuous contact is maintained).</p>
+<p>The cross-environment experiment uses three conditions, each run for 100 episodes across 5 independent seeds:</p>
+<ul>
+<li><strong>Baseline</strong>: FetchSlide with no memory (100 episodes × 5 seeds)</li>
+<li><strong>Cross-environment</strong>: FetchSlide + FetchPush memories (100 episodes × 5 seeds)</li>
+<li><strong>Same-environment</strong>: FetchSlide + FetchSlide memories (100 episodes × 5 seeds)</li>
+</ul>
+<p>For each seed, a fresh set of FetchPush memories is generated (100 episodes) before testing cross-environment transfer. Same-environment memories are generated from a separate FetchSlide writing phase (100 episodes).</p>
+<hr />
+<h2>4. Results</h2>
+<h3>4.1 FetchPush-v4 (Memory Augmentation)</h3>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Strategy</th>
+<th>Success Rate (5 seeds)</th>
+<th>Avg Distance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A (ep 1-100)</td>
+<td>Heuristic baseline</td>
+<td>52.4% ± 4.6%</td>
+<td>0.084 ± 0.012m</td>
+</tr>
+<tr>
+<td>B (ep 101-200)</td>
+<td>Memory write (heuristic + learn)</td>
+<td>47.6% ± 6.2%</td>
+<td>0.097 ± 0.019m</td>
+</tr>
+<tr>
+<td>C (ep 201-300)</td>
+<td>Memory read/write (recall + learn)</td>
+<td><strong>61.2% ± 4.6%</strong></td>
+<td>0.078 ± 0.015m</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key findings:</strong></p>
+<ul>
+<li>Phase C shows +8.8 ± 4.4 percentage point improvement over Phase A (paired t(4) = 3.96, p = 0.017; Cohen's d = 1.77; Hedges' g = 1.53, large effect). All 5 seeds show Phase C &gt; Phase A (per-seed deltas: +4, +14, +11, +12, +3 pp). The recall mechanism allows the agent to adjust its push velocity based on spatially similar successful experiences. We note that with only 5 seeds (df = 4), statistical power is limited and small-sample effect size estimates tend to be positively biased; larger-scale replication would strengthen this finding.</li>
+<li>Phase B shows no statistically significant difference from Phase A (paired t(4) = -1.00, p = 0.37). The apparent Phase B improvement in our earlier single-seed pilot was seed-specific variance. The memory write operations (learn + save_perception) do not affect policy behavior, as expected.</li>
+<li>Average final distance in Phase C (0.078m) is lower than Phase A (0.084m), though the improvement is modest compared to the success rate gain. This suggests memory augmentation primarily helps with task completion (pushing the object close enough to succeed) rather than fine-grained precision.</li>
+</ul>
+<h3>4.2 Cross-Environment Transfer (FetchPush → FetchSlide)</h3>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Success Rate (5 seeds)</th>
+<th>Delta vs. Baseline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FetchSlide baseline (no memory)</td>
+<td>6.6% ± 2.3%</td>
+<td>—</td>
+</tr>
+<tr>
+<td>FetchSlide + FetchPush memories</td>
+<td><strong>15.8% ± 2.7%</strong></td>
+<td>+9.2 ± 3.9pp</td>
+</tr>
+<tr>
+<td>FetchSlide + FetchSlide memories</td>
+<td>7.0% ± 1.9%</td>
+<td>+0.4pp (n.s.)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key findings:</strong></p>
+<ul>
+<li>Cross-environment transfer (FetchPush → FetchSlide) yields +9.2 ± 3.9 percentage point improvement over baseline (paired t(4) = 4.76, p = 0.009; Cohen's d = 2.13, large effect). Per-seed deltas: +12, +2, +10, +13, +9 pp.</li>
+<li><strong>Same-environment transfer shows no significant benefit</strong> (paired t(4) = 0.21, p = 0.84). Our earlier single-seed pilot showed 16% same-environment success, which multi-seed replication reveals as seed-specific noise. This asymmetry — cross-environment transfer works but same-environment does not — is the most surprising finding and is discussed further in Section 6.</li>
+<li>The low absolute success rates (6-16%) reflect the inherently harder FetchSlide task and the limitations of our heuristic baseline on sliding tasks. The heuristic was designed for push (continuous contact), not slide (impulse + inertia), limiting the ceiling of memory-augmented performance.</li>
+</ul>
+<h3>4.3 Ablation: Push-Phase-Only vs. All-Phase Blending</h3>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Success Rate (3 seeds)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Baseline (no memory)</td>
+<td>49.3% ± 3.3%</td>
+</tr>
+<tr>
+<td>Push-phase-only (PhaseAwareMemoryPolicy)</td>
+<td>59.0% ± 1.6%</td>
+</tr>
+<tr>
+<td>All-phase (MemoryPolicy)</td>
+<td><strong>65.3% ± 3.3%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>We compare two memory blending strategies: applying the recalled velocity bias only during the push phase (phase 4) versus during all four phases (rise, move-behind, descend, push). The ablation uses 3 seeds (vs. 5 in the main experiments) due to the need to run three conditions per seed; we prioritized additional conditions over additional seeds. The ablation baseline (49.3%) differs from the main experiment Phase A (52.4%) because different seed sets were used; both values are within each other's standard deviation.</p>
+<p><strong>Key findings:</strong></p>
+<ul>
+<li>All-phase blending (65.3%) outperforms push-phase-only (59.0%) by +6.3 percentage points, overturning our initial hypothesis that memory bias should be restricted to the push phase. With only 3 seeds (df = 2), these results constitute descriptive evidence; statistical testing requires additional seeds (t-critical at alpha=0.05, df=2 is 4.303, making significance difficult to achieve).</li>
+<li>Both memory conditions substantially outperform the baseline (+9.7pp for push-only, +16.0pp for all-phase), with all 3 seeds showing the same ranking (all-phase &gt; push-only &gt; baseline).</li>
+<li>The all-phase advantage suggests that recalled experiences encode useful information beyond push velocity: approach direction during positioning (phases 1-3) benefits from memories of successful trajectories. This aligns with the cross-environment transfer finding — the approach strategy, not just the push force, is the primary transferable knowledge.</li>
+</ul>
+<h3>4.4 Qualitative Analysis</h3>
+<p>Examining recalled memories provides insight into what transfers:</p>
+<ul>
+<li><strong>Approach direction</strong>: Memories consistently encode positioning behind the object relative to the target. The all-phase ablation confirms this directional information benefits the entire trajectory, not just the push.</li>
+<li><strong>Force calibration</strong>: Successful FetchPush memories encode approach velocities (mean 0.15 m/step) that modulate push velocity when blended at w=0.3. In cross-environment transfer, these values provide a directional signal even when the optimal force for FetchSlide differs.</li>
+</ul>
+<h3>4.5 Discussion: Abstract Memories Transfer Better Than Specific Ones</h3>
+<p>The most striking finding across our experiments is the asymmetry in cross-environment vs. same-environment transfer on FetchSlide. FetchPush memories — which encode an <em>approach strategy</em> abstracted from a different task — improve FetchSlide performance by +9.2pp, while FetchSlide's own memories provide no benefit. This pattern suggests a counterintuitive principle: <strong>memories that are more abstract (from a different but related task) may transfer more effectively than task-specific memories.</strong></p>
+<p>We hypothesize three contributing factors:</p>
+<ol>
+<li>
+<p><strong>Abstraction as regularization</strong>: FetchPush memories encode general approach behaviors (direction, contact initiation) without task-specific force parameters. When applied to FetchSlide, the irrelevant force details are diluted by the low blending weight (w=0.3), while the transferable directional information remains. FetchSlide memories, by contrast, encode both generalizable direction <em>and</em> task-specific impulse values — but the linear blending mechanism cannot selectively apply one without the other.</p>
+</li>
+<li>
+<p><strong>Diversity vs. specificity</strong>: 100 episodes of FetchPush generate diverse approach strategies across varied object-target configurations. The same number of FetchSlide episodes generates memories optimized for the narrower sliding dynamics, which may overfit to specific configurations encountered during memory accumulation.</p>
+</li>
+<li>
+<p><strong>Alignment with curriculum learning</strong>: This finding echoes curriculum learning literature, where training on simpler tasks before harder ones often outperforms direct training. FetchPush memories effectively provide a "curriculum" of approach behaviors that, when recalled during FetchSlide, bootstrap the agent's positioning without constraining its task-specific execution.</p>
+</li>
+</ol>
+<p>This hypothesis is testable: a controlled experiment comparing (a) NL memories from a different task, (b) numerical vectors from a different task, (c) NL memories from the same task, and (d) numerical vectors from the same task would isolate the contributions of abstraction level and cross-task diversity. We leave this 2×2 factorial design to future work.</p>
+<hr />
+<h2>5. Related Work</h2>
+<p><strong>Experience Replay</strong> [1]: The foundational technique for reusing transitions within a single training run.</p>
+<p><strong>Hindsight Experience Replay (HER)</strong> [9]: Enables learning from failed trajectories by relabeling goals post-hoc. HER is the standard method for FetchPush and achieves &gt;90% success rate with SAC. robotmem is complementary: HER optimizes within-run learning efficiency, while robotmem provides cross-run and cross-environment persistence.</p>
+<p><strong>Transfer Learning in Robotics</strong>: Progressive neural networks [10] enable cross-task transfer by lateral connections. Policy distillation [11] compresses multi-task knowledge. Sim-to-real approaches transfer policies across simulation and physical domains. These methods transfer at the policy parameter level; robotmem transfers at the experience level using natural language, enabling human-readable, architecture-independent transfer.</p>
+<p><strong>Retrieval-Augmented Generation (RAG)</strong> [12]: Widely successful in NLP for grounding LLM outputs in retrieved documents. robotmem can be viewed as RAG for robotics: retrieving relevant past experiences to augment current decision-making. Unlike NLP RAG where an LLM synthesizes retrieved context, our current implementation uses simple linear blending — a deliberate simplification that trades reasoning capability for latency and determinism.</p>
+<p><strong>Semantic Robot Memory</strong>: KnowRob [13] provides a knowledge processing framework for robots using ontological representations. robotmem differs in using natural language rather than formal ontologies, trading inference power for flexibility and human readability.</p>
+<p><strong>MemoryVLA</strong> [2] (Tsinghua, 2025): Augments VLA models with learned memory modules. Model-specific, not transferable across architectures.</p>
+<p><strong>MemER</strong> [3] (Stanford, 2025): Memory-enhanced robot learning with retrieval-augmented policies. Closest to our approach in using retrieval for policy augmentation, but integrated into a specific learning framework rather than designed as standalone infrastructure.</p>
+<p><strong>EchoVLA</strong> [4] (Sun Yat-sen, 2025): Echoes past experiences for VLA improvement. Focuses on vision-language models specifically.</p>
+<p><strong>DynaMem</strong> [5] (NYU, 2025): Dynamic memory for adaptive robot manipulation. Uses point cloud features rather than natural language.</p>
+<p><strong>RMBench</strong> [6] (HKU, 2025): Benchmarks for robot memory. Complementary to our work — robotmem could serve as a backend for RMBench evaluations.</p>
+<p>robotmem differs from these approaches in being (a) model-agnostic, (b) open-source, (c) based on natural language storage for human readability and cross-environment transfer, and (d) requiring no external services.</p>
+<hr />
+<h2>6. Limitations and Future Work</h2>
+<p><strong>Limitations:</strong></p>
+<ul>
+<li>Our evaluation uses a heuristic policy as a proof-of-concept baseline. We have designed a corresponding SAC+HER experiment with RL-Zoo3-verified hyperparameters, but the computational requirements exceeded available resources for this submission. The fully configured experiment script is included in the repository (<code>examples/fetch_push/sac_experiment.py</code>); we estimate ~10 min/seed on GPU hardware. Validation with learned RL policies may yield different effects, as such policies can more flexibly incorporate recalled information.</li>
+<li>While multi-seed (5 seeds) results show consistent improvement, the effect size (+8.8pp on FetchPush) is modest. Larger effects may emerge with learned policies that can more flexibly incorporate recalled information.</li>
+<li>The linear blending mechanism (<code>action = (1-w) × base + w × bias</code>) is fundamentally limited: it can only interpolate between the heuristic and memory-derived actions. For tasks requiring qualitatively different action profiles — such as FetchSlide's "strong impulse then release" — linear blending with a fixed w=0.3 cannot produce the required discontinuous behavior. This likely explains the same-environment transfer failure on FetchSlide: recalled Slide memories encode optimal impulse magnitudes, but the blending mechanism cannot faithfully reproduce them.</li>
+<li>Same-environment transfer on FetchSlide showed no benefit, while cross-environment transfer succeeded. We hypothesize that FetchPush memories transfer a generalizable <em>approach strategy</em> (direction, contact initiation) rather than task-specific force parameters. FetchSlide memories, by contrast, encode impulse-specific parameters that the linear blending mechanism cannot faithfully apply. Disentangling the contributions of approach direction vs. force calibration requires per-channel ablation and is left to future work.</li>
+<li>The natural language storage format, while enabling transfer and human readability, may lose precision compared to raw numerical storage for fine-grained motor control.</li>
+<li>The 0.3 memory blending weight is manually tuned and globally fixed; adaptive weighting based on memory relevance and confidence could improve performance.</li>
+<li>The current system stores episode-level summaries, not step-level trajectories or raw sensory data (images, point clouds, force-torque curves). Full sensory storage is deferred to future work.</li>
+</ul>
+<p><strong>Future Work:</strong></p>
+<ul>
+<li>Integration with learned RL policies (SAC+HER, PPO, TD3) to measure memory augmentation in the standard FetchPush setting. We expect partially-trained policies (50-60% baseline) to benefit most from memory augmentation, as they retain room for improvement while having learned sufficient basic manipulation skills — analogous to our heuristic baseline at ~52%, where memory augmentation yielded +8.8pp. The magnitude of improvement may differ due to the different policy architecture.</li>
+<li>Retrieval channel ablation: spatial-only vs. vector-only vs. FTS5-only to quantify each channel's contribution</li>
+<li>Visual and force-torque memory: storing and retrieving image-based and haptic experiences</li>
+<li>Adaptive memory blending weight based on retrieval confidence</li>
+<li>Benchmarking on Isaac Gym and PyBullet environments</li>
+<li>Controlled comparison of natural language vs. raw numerical memory storage to isolate the role of language abstraction in cross-environment transfer</li>
+<li>Non-linear blending mechanisms (e.g., gated networks, attention-weighted fusion) that can produce discontinuous action profiles required by tasks like FetchSlide</li>
+<li>Rust SDK for real-time robot control with microsecond-level recall latency</li>
+</ul>
+<hr />
+<h2>7. Conclusion</h2>
+<p>We presented robotmem, an open-source episodic memory system that gives robot learning agents persistent, queryable memory across episodes and environments. Multi-seed experiments on MuJoCo FetchPush-v4 (5 seeds) demonstrate that memory augmentation of a heuristic baseline improves success rate by +8.8 ± 4.4 percentage points. Cross-environment transfer from FetchPush to FetchSlide (5 seeds) yields +9.2 ± 3.9pp improvement, providing evidence that natural-language-stored experiences transfer across environments with different dynamics. An ablation study reveals that all-phase memory blending (65.3%) outperforms push-phase-only (59.0%), indicating that recalled experiences benefit the full trajectory, not just the execution phase. These results demonstrate that episodic memory in natural language is a viable knowledge representation for robot learning, complementing rather than competing with learned policies. robotmem is designed as universal infrastructure: model-agnostic, lightweight (SQLite-based), and integrable via MCP or Python SDK. We release the code, experiment scripts, and accompanying documentation to support reproducible research in memory-augmented robot learning.</p>
+<p><strong>Code:</strong> https://github.com/robotmem/robotmem</p>
+<p><strong>Install:</strong> <code>pip install robotmem</code></p>
+<p><strong>Reproduce all experiments:</strong> <code>python examples/fetch_push/paper_experiments.py</code></p>
+<p><strong>DOI:</strong> 10.5281/zenodo.18925678</p>
+<hr />
+<h2>References</h2>
+<p>[1] T. Schaul, J. Quan, I. Antonoglou, and D. Silver, "Prioritized Experience Replay," arXiv:1511.05952, 2015.</p>
+<p>[2] G. Huang et al., "MemoryVLA: Memory-Augmented Vision-Language-Action Models," arXiv preprint, Tsinghua University, 2025.</p>
+<p>[3] A. Sridhar et al., "MemER: Memory-Enhanced Robot Learning," arXiv preprint, Stanford University, 2025.</p>
+<p>[4] X. Liang et al., "EchoVLA: Echoing Past Experiences for Vision-Language-Action Improvement," arXiv preprint, Sun Yat-sen University, 2025.</p>
+<p>[5] L. Pinto et al., "DynaMem: Dynamic Memory for Adaptive Robot Manipulation," arXiv preprint, NYU, 2025.</p>
+<p>[6] Y. Mu et al., "RMBench: Benchmarking Robot Memory Systems," arXiv preprint, HKU, 2025.</p>
+<p>[7] M. Plappert et al., "Multi-Goal Reinforcement Learning: Challenging Robotics Environments and Request for Research," arXiv:1802.09464, 2018.</p>
+<p>[8] Farama Foundation, "Gymnasium-Robotics," https://github.com/Farama-Foundation/Gymnasium-Robotics, 2023.</p>
+<p>[9] M. Andrychowicz et al., "Hindsight Experience Replay," NeurIPS, 2017.</p>
+<p>[10] A. Rusu et al., "Progressive Neural Networks," arXiv:1606.04671, 2016.</p>
+<p>[11] A. Rusu et al., "Policy Distillation," arXiv:1511.06295, 2015.</p>
+<p>[12] P. Lewis et al., "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks," NeurIPS, 2020.</p>
+<p>[13] M. Tenorth and M. Beetz, "KnowRob: A knowledge processing framework for cognition-enabled robotic agents," IEEE ICRA, 2009.</p>
+<p>[14] G. Cormack, C. Clarke, and S. Buettcher, "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods," SIGIR, 2009.</p>
+<hr />
+<p><em>This work is licensed under Apache License 2.0.</em></p>
+</body>
+</html>

@@ -40,10 +40,17 @@ node_modules/
 htmlcov/
 
 # Experiment data
-examples/**/.robotmem/
+examples/**/.robotmem*/
+examples/**/models/
+examples/**/results/
+*.db
 
 # Claude internal
 .claude/skyeye_snapshot.md
+
+# Publishing (contains private paths/email)
+PUBLISH.md
+scripts/send_outreach.py
 
 # Rust
 crate/target/

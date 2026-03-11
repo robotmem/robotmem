@@ -1,0 +1,7 @@
+[package]
+name = "robotmem"
+version = "0.0.1"
+edition = "2021"
+description = "Robot Memory - Persistent memory system for AI agents"
+license = "MIT"
+repository = "https://github.com/robotmem/robotmem"

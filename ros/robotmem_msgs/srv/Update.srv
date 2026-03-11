@@ -1,0 +1,8 @@
+int64 memory_id                 # 必填
+string new_content              # 必填
+string context                  # 选填
+---
+bool success
+string old_content
+string new_content_out          # 避免与 request 字段同名
+string error

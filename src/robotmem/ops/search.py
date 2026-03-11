@@ -1,6 +1,8 @@
 """搜索领域 — FTS5 / 向量搜索（recall 用）
 
-返回完整记忆字段供 recall 使用。
+从 index1 精简：去掉 orient / universal / applicable_when 等。
+返回完整记忆字段供 recall 使用（区别于 db_cog.py 的 dedup 最小字段）。
+
 每个函数接收 conn: sqlite3.Connection 作为第一参数。
 """
 

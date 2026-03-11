@@ -1,4 +1,7 @@
 """容错原语 — safe_db_write / safe_db_transaction / mcp_error_boundary / ServiceCooldown
+
+robotmem 精简版：去掉 CircuitBreaker / FileStateCircuitBreaker / ProcessManager /
+graceful_kill / create_http_client（index1 hooks/observer 专用）。
 """
 
 from __future__ import annotations

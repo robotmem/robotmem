@@ -1,5 +1,8 @@
 """会话领域 — Session 生命周期
 
+从 index1 精简：去掉 maintenance_state / orient_feedback / brief /
+raw_events / detect_expired / stats 等。
+
 每个函数接收 conn: sqlite3.Connection 作为第一参数。
 """
 

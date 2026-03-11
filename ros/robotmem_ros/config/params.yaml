@@ -1,0 +1,8 @@
+robotmem:
+  ros__parameters:
+    db_path: ""                      # 空 = ~/.robotmem/memory.db
+    collection: "default"
+    embed_backend: "onnx"            # "onnx" / "ollama" / "none"
+    perception_qos: "reliable"       # "reliable" / "best_effort"
+    perception_batch_size: 50
+    perception_flush_interval: 1.0   # 秒

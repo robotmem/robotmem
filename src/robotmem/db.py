@@ -1,6 +1,6 @@
 """SQLite 工具函数 — FTS5 分词 + 向量序列化
 
-公共工具，供 db_cog.py / ops/ / search.py 使用。
+从 index1 db.py 抽取的公共工具，供 db_cog.py / ops/ / search.py 使用。
 """
 
 from __future__ import annotations

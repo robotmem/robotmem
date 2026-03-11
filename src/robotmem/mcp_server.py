@@ -10,54 +10,18 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from .auto_classify import (
-    build_context_json,
-    classify_category,
-    classify_tags,
-    estimate_confidence,
-    extract_scope,
-    normalize_scope_files,
-)
 from .config import Config, load_config
 from .db_cog import CogDatabase
-from .dedup import check_duplicate
 from .embed import Embedder, create_embedder
-from .ops.memories import (
-    apply_time_decay,
-    consolidate_session as do_consolidate,
-    get_memory,
-    insert_memory,
-    invalidate_memory,
-    update_memory,
-    update_memory_embedding,
-)
-from .ops.sessions import (
-    get_or_create_session,
-    get_session_summary,
-    insert_session_outcome,
-    mark_session_ended,
-    update_session_context,
-)
-from .ops.tags import add_tags
+from .exceptions import DatabaseError, ValidationError
 from .resilience import mcp_error_boundary
-from .search import recall as do_recall
-from .validators import (
-    EndSessionParams,
-    ForgetParams,
-    LearnParams,
-    RecallParams,
-    SavePerceptionParams,
-    StartSessionParams,
-    UpdateParams,
-    parse_params,
-)
+from .sdk import RobotMemory
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +33,7 @@ class AppContext:
     config: Config
     db_cog: CogDatabase
     embedder: Embedder
+    sdk: RobotMemory
     default_collection: str = "default"
 
 
@@ -102,14 +67,23 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     except Exception as e:
         logger.warning("robotmem 启动: embedding 检测异常 — %s", e)
 
+    # 创建 SDK 实例（复用 db/embedder，不创建新连接）
+    sdk = RobotMemory._from_components(
+        db=db_cog,
+        embedder=embedder if embedder.available else None,
+        collection=config.default_collection,
+    )
+
     try:
         yield AppContext(
             config=config,
             db_cog=db_cog,
             embedder=embedder,
+            sdk=sdk,
             default_collection=config.default_collection,
         )
     finally:
+        sdk.close()  # _owns_resources=False，不释放共享资源
         await embedder.close()
         db_cog.close()
 
@@ -140,120 +114,25 @@ async def learn(
 ) -> dict:
     """记录物理经验（declarative memory）
 
-    三层防御：
-    - L1 事前：insight 非空 + 截断 300 字
-    - L2 事中：auto_classify + dedup + 原子写入
-    - L3 事后：返回 memory_id + auto_inferred
+    委托给 SDK.learn()，MCP 层只负责：
+    1. 获取 AppContext
+    2. 解析 collection
+    3. 捕获 SDK 异常 → 转为 {"error": ...}
     """
     app = _get_ctx(ctx)
-
-    # L1: Pydantic 校验
-    result = parse_params(
-        LearnParams, insight=insight, context=context,
-        collection=collection, session_id=session_id,
-    )
-    if isinstance(result, dict):
-        return result
-    params = result
-
-    coll = _resolve_collection(app, params.collection)
-    insight = params.insight
-    context = params.context
-
-    # L2: auto_classify — 每步 try-except 降级
-    try:
-        category = classify_category(insight)
-    except Exception as e:
-        logger.debug("learn classify_category 降级: %s", e)
-        category = "observation"
+    coll = _resolve_collection(app, collection)
 
     try:
-        confidence = estimate_confidence(insight, context)
-    except Exception as e:
-        logger.debug("learn estimate_confidence 降级: %s", e)
-        confidence = 0.9
-
-    try:
-        scope = extract_scope(insight)
-        scope_files = normalize_scope_files(scope.get("scope_files", []))
-        scope_entities = scope.get("scope_entities", [])
-    except Exception as e:
-        logger.debug("learn extract_scope 降级: %s", e)
-        scope_files, scope_entities = [], []
-
-    try:
-        inferred_tags = classify_tags(insight, context)
-    except Exception as e:
-        logger.debug("learn classify_tags 降级: %s", e)
-        inferred_tags = []
-
-    try:
-        ctx_json = build_context_json(insight, context)
-    except Exception as e:
-        logger.debug("learn build_context_json 降级: %s", e)
-        ctx_json = context
-
-    # L2: 去重
-    try:
-        dedup_result = check_duplicate(
-            insight, coll, session_id,
-            app.db_cog, app.embedder if app.embedder.available else None,
+        return app.sdk.learn(
+            insight=insight,
+            context=context,
+            session_id=session_id,
+            collection=coll,
         )
-        if dedup_result.is_dup:
-            existing_id = (
-                dedup_result.similar_facts[0].get("id")
-                if dedup_result.similar_facts else None
-            )
-            return {
-                "status": "duplicate",
-                "method": dedup_result.method,
-                "existing_id": existing_id,
-                "similarity": dedup_result.similarity,
-            }
-    except Exception as e:
-        logger.warning("learn 去重检查异常: %s", e)
-
-    # L2: embedding（降级为 None）
-    embedding = None
-    if app.embedder.available:
-        try:
-            embedding = await app.embedder.embed_one(insight)
-        except Exception as e:
-            logger.warning("learn embedding 失败: %s", e)
-
-    # L2: 原子写入
-    memory_id = insert_memory(app.db_cog.conn, {
-        "session_id": params.session_id,
-        "collection": coll,
-        "type": "fact",
-        "content": insight,
-        "human_summary": insight[:200],
-        "context": ctx_json if isinstance(ctx_json, str) else json.dumps(ctx_json),
-        "category": category,
-        "confidence": confidence,
-        "source": "tool",
-        "scope": "project",
-        "scope_files": json.dumps(scope_files),
-        "scope_entities": json.dumps(scope_entities),
-        "embedding": embedding,
-        "tags": inferred_tags,
-        "tag_source": "auto",
-    }, vec_loaded=app.db_cog.vec_loaded)
-
-    if not memory_id:
-        return {"error": "写入失败（可能重复）"}
-
-    # L3: 返回
-    return {
-        "status": "created",
-        "memory_id": memory_id,
-        "auto_inferred": {
-            "category": category,
-            "confidence": confidence,
-            "tags": inferred_tags,
-            "scope_files": scope_files,
-        },
-    }
+    except ValidationError as e:
+        return {"error": str(e)}
+    except DatabaseError as e:
+        return {"error": str(e)}
 
 
 # ── Tool 2: recall ──
@@ -281,26 +160,17 @@ async def recall(
     spatial_sort: JSON 字符串，空间近邻排序。
         '{"field": "spatial.object_position", "target": [1.3, 0.7, 0.42]}'
         可选 max_distance 截断: '{"field": "...", "target": [...], "max_distance": 0.1}'
+
+    MCP 层负责 JSON 字符串解析，SDK 接受 dict。
     """
     app = _get_ctx(ctx)
+    coll = _resolve_collection(app, collection)
 
-    # L1: Pydantic 校验
-    validated = parse_params(
-        RecallParams, query=query, collection=collection,
-        n=n, min_confidence=min_confidence, session_id=session_id,
-        context_filter=context_filter, spatial_sort=spatial_sort,
-    )
-    if isinstance(validated, dict):
-        return validated
-    params = validated
-
-    coll = _resolve_collection(app, params.collection)
-
-    # L2: 解析 context_filter JSON
+    # MCP 层：JSON 字符串 → dict（SDK 直接接受 dict）
     cf_dict = None
-    if params.context_filter:
+    if context_filter:
         try:
-            cf_dict = json.loads(params.context_filter)
+            cf_dict = json.loads(context_filter)
             if not isinstance(cf_dict, dict):
                 return {"error": "context_filter 必须为 JSON 对象"}
             if len(cf_dict) > 10:
@@ -308,11 +178,10 @@ async def recall(
         except json.JSONDecodeError as e:
             return {"error": f"context_filter JSON 解析失败: {e}"}
 
-    # L2: 解析 spatial_sort JSON
     ss_dict = None
-    if params.spatial_sort:
+    if spatial_sort:
         try:
-            ss_dict = json.loads(params.spatial_sort)
+            ss_dict = json.loads(spatial_sort)
             if not isinstance(ss_dict, dict):
                 return {"error": "spatial_sort 必须为 JSON 对象"}
             if "field" not in ss_dict or "target" not in ss_dict:
@@ -322,23 +191,23 @@ async def recall(
         except json.JSONDecodeError as e:
             return {"error": f"spatial_sort JSON 解析失败: {e}"}
 
-    result = await do_recall(
-        query=params.query,
-        db=app.db_cog,
-        embedder=app.embedder if app.embedder.available else None,
-        collection=coll,
-        top_k=params.n,
-        min_confidence=params.min_confidence,
-        session_id=params.session_id,
-        context_filter=cf_dict,
-        spatial_sort=ss_dict,
-    )
+    try:
+        memories = app.sdk.recall(
+            query=query,
+            n=n,
+            min_confidence=min_confidence,
+            session_id=session_id,
+            context_filter=cf_dict,
+            spatial_sort=ss_dict,
+            collection=coll,
+        )
+    except ValidationError as e:
+        return {"error": str(e)}
 
     return {
-        "memories": result.memories,
-        "total": result.total,
-        "mode": result.mode,
-        "query_ms": round(result.query_ms, 1),
+        "memories": memories,
+        "total": len(memories),
+        "mode": "hybrid" if app.embedder.available else "bm25_only",
     }
 
 
@@ -357,61 +226,24 @@ async def save_perception(
 ) -> dict:
     """保存感知/轨迹/力矩（procedural memory）
 
-    三层防御：
-    - L1 事前：description 非空 + perception_type 白名单
-    - L2 事中：embedding + 原子写入
-    - L3 事后：返回 memory_id
+    委托给 SDK.save_perception()，MCP 层只负责异常转换。
     """
     app = _get_ctx(ctx)
+    coll = _resolve_collection(app, collection)
 
-    # L1: Pydantic 校验
-    result = parse_params(
-        SavePerceptionParams, description=description,
-        perception_type=perception_type, data=data, metadata=metadata,
-        collection=collection, session_id=session_id,
-    )
-    if isinstance(result, dict):
-        return result
-    params = result
-
-    coll = _resolve_collection(app, params.collection)
-    description = params.description
-
-    # L2: embedding（降级为 None）
-    embedding = None
-    if app.embedder.available:
-        try:
-            embedding = await app.embedder.embed_one(description)
-        except Exception as e:
-            logger.warning("save_perception embedding 失败: %s", e)
-
-    # L2: 原子写入
-    memory_id = insert_memory(app.db_cog.conn, {
-        "session_id": params.session_id,
-        "collection": coll,
-        "type": "perception",
-        "content": description,
-        "human_summary": description[:200],
-        "perception_type": params.perception_type,
-        "perception_data": params.data,
-        "perception_metadata": params.metadata,
-        "category": "observation",
-        "confidence": 0.9,
-        "source": "tool",
-        "scope": "project",
-        "embedding": embedding,
-    }, vec_loaded=app.db_cog.vec_loaded)
-
-    if not memory_id:
-        return {"error": "写入失败（可能重复）"}
-
-    # L3: 返回
-    return {
-        "memory_id": memory_id,
-        "perception_type": params.perception_type,
-        "collection": coll,
-        "has_embedding": embedding is not None,
-    }
+    try:
+        return app.sdk.save_perception(
+            description=description,
+            perception_type=perception_type,
+            data=data,
+            metadata=metadata,
+            session_id=session_id,
+            collection=coll,
+        )
+    except ValidationError as e:
+        return {"error": str(e)}
+    except DatabaseError as e:
+        return {"error": str(e)}
 
 
 # ── Tool 4: forget ──
@@ -425,36 +257,16 @@ async def forget(
 ) -> dict:
     """删除错误记忆（软删除）
 
-    三层防御：
-    - L1 事前：memory_id 正整数 + reason 非空
-    - L2 事中：归属校验 + invalidate
-    - L3 事后：返回确认
+    委托给 SDK.forget()，MCP 层只负责异常转换。
     """
     app = _get_ctx(ctx)
 
-    # L1: Pydantic 校验
-    result = parse_params(ForgetParams, memory_id=memory_id, reason=reason)
-    if isinstance(result, dict):
-        return result
-    params = result
-
-    # L2: 归属校验
-    mem = get_memory(app.db_cog.conn, params.memory_id)
-    if not mem:
-        return {"error": f"记忆 #{params.memory_id} 不存在"}
-    if mem.get("status") != "active":
-        return {"error": f"记忆 #{params.memory_id} 状态为 {mem.get('status')}，无法删除"}
-
-    # L2: 软删除
-    invalidate_memory(app.db_cog.conn, params.memory_id, params.reason)
-
-    # L3: 返回
-    return {
-        "status": "forgotten",
-        "memory_id": params.memory_id,
-        "content": (mem.get("content") or "")[:100],
-        "reason": params.reason,
-    }
+    try:
+        return app.sdk.forget(memory_id=memory_id, reason=reason)
+    except ValidationError as e:
+        return {"error": str(e)}
+    except DatabaseError as e:
+        return {"error": str(e)}
 
 
 # ── Tool 5: update ──
@@ -469,76 +281,20 @@ async def update(
 ) -> dict:
     """修正记忆内容
 
-    三层防御：
-    - L1 事前：memory_id 正整数 + new_content 非空
-    - L2 事中：归属校验 + auto_classify + 原子更新
-    - L3 事后：返回 old/new 对照
+    委托给 SDK.update()，MCP 层只负责异常转换。
     """
     app = _get_ctx(ctx)
 
-    # L1: Pydantic 校验
-    result = parse_params(
-        UpdateParams, memory_id=memory_id,
-        new_content=new_content, context=context,
-    )
-    if isinstance(result, dict):
-        return result
-    params = result
-
-    # L2: 归属校验
-    mem = get_memory(app.db_cog.conn, params.memory_id)
-    if not mem:
-        return {"error": f"记忆 #{params.memory_id} 不存在"}
-    if mem.get("status") != "active":
-        return {"error": f"记忆 #{params.memory_id} 状态为 {mem.get('status')}，无法更新"}
-
-    old_content = mem.get("content", "")
-
-    # L2: 重新分类
     try:
-        category = classify_category(params.new_content)
-        confidence = estimate_confidence(params.new_content, params.context)
-    except Exception:
-        category = mem.get("category", "observation")
-        confidence = mem.get("confidence", 0.9)
-
-    # L2: 更新
-    update_memory(
-        app.db_cog.conn, params.memory_id,
-        content=params.new_content,
-        category=category,
-        confidence=confidence,
-    )
-
-    # L2: 重建 embedding（降级跳过）
-    if app.embedder.available:
-        try:
-            new_emb = await app.embedder.embed_one(params.new_content)
-            update_memory_embedding(
-                app.db_cog.conn, params.memory_id, new_emb, vec_loaded=app.db_cog.vec_loaded,
-            )
-        except Exception as e:
-            logger.warning("update embedding 重建失败: %s", e)
-
-    # L2: 重建 tags
-    try:
-        inferred_tags = classify_tags(params.new_content, params.context)
-        if inferred_tags:
-            add_tags(app.db_cog.conn, params.memory_id, inferred_tags, source="auto")
-    except Exception as e:
-        logger.warning("update tags 重建失败: %s", e)
-
-    # L3: 返回
-    return {
-        "status": "updated",
-        "memory_id": params.memory_id,
-        "old_content": old_content[:100],
-        "new_content": params.new_content[:100],
-        "auto_inferred": {
-            "category": category,
-            "confidence": confidence,
-        },
-    }
+        return app.sdk.update(
+            memory_id=memory_id,
+            new_content=new_content,
+            context=context,
+        )
+    except ValidationError as e:
+        return {"error": str(e)}
+    except DatabaseError as e:
+        return {"error": str(e)}
 
 
 # ── Tool 6: start/end session ──
@@ -557,34 +313,19 @@ async def start_session(
         start_session(context='{"robot_id": "arm-01", "robot_model": "UR5e",
                                 "environment": "kitchen-3F", "task_domain": "pick-and-place"}')
 
-    三层防御：
-    - L1 事前：collection 解析
-    - L2 事中：创建 session + 写入 context
-    - L3 事后：返回 session_id
+    委托给 SDK.start_session()，MCP 层添加 active_memories_count。
     """
     app = _get_ctx(ctx)
+    coll = _resolve_collection(app, collection)
 
-    # L1: Pydantic 校验
-    result = parse_params(
-        StartSessionParams, collection=collection, context=context,
-    )
-    if isinstance(result, dict):
-        return result
-    params = result
+    try:
+        sid = app.sdk.start_session(context=context, collection=coll)
+    except ValidationError as e:
+        return {"error": str(e)}
+    except DatabaseError as e:
+        return {"error": str(e)}
 
-    coll = _resolve_collection(app, params.collection)
-
-    # L2: 创建 session
-    ext_id = str(uuid.uuid4())
-    session = get_or_create_session(app.db_cog.conn, ext_id, coll)
-    if not session:
-        return {"error": "创建 session 失败"}
-
-    # L2: 写入 context
-    if params.context:
-        update_session_context(app.db_cog.conn, ext_id, params.context)
-
-    # L3: 统计 active 记忆数
+    # MCP-specific: 统计 active 记忆数
     try:
         active_count = app.db_cog.conn.execute(
             "SELECT COUNT(*) FROM memories WHERE collection=? AND status='active'",
@@ -593,10 +334,10 @@ async def start_session(
     except Exception:
         active_count = 0
 
-    logger.info("MCP start_session: session_id=%s, collection=%s", ext_id, coll)
+    logger.info("MCP start_session: session_id=%s, collection=%s", sid, coll)
 
     return {
-        "session_id": ext_id,
+        "session_id": sid,
         "collection": coll,
         "active_memories_count": active_count,
     }
@@ -609,100 +350,31 @@ async def end_session(
     ctx: Context,
     outcome_score: float | None = None,
 ) -> dict:
-    """结束会话 — 标记结束 + 时间衰减 + 评分
+    """结束会话 — 标记结束 + 时间衰减 + 巩固 + 评分
 
-    三层防御：
-    - L1 事前：session_id 非空
-    - L2 事中：mark_session_ended + apply_time_decay + insert_outcome
-    - L3 事后：返回 summary
+    委托给 SDK.end_session()，MCP 层只负责异常转换 + 日志。
     """
     app = _get_ctx(ctx)
 
-    # L1: Pydantic 校验
-    result = parse_params(
-        EndSessionParams, session_id=session_id, outcome_score=outcome_score,
-    )
-    if isinstance(result, dict):
-        return result
-    params = result
-
-    # 查询 session 关联的 collection
     try:
-        row = app.db_cog.conn.execute(
-            "SELECT collection FROM sessions WHERE external_id=?",
-            (params.session_id,),
-        ).fetchone()
-        coll = row[0] if row else app.default_collection
-    except Exception:
-        coll = app.default_collection
-
-    # L2: 标记结束
-    mark_session_ended(app.db_cog.conn, params.session_id)
-
-    # L2: 时间衰减（Abbeel 产品架构 Round 2）
-    decayed = 0
-    try:
-        decayed = apply_time_decay(app.db_cog.conn)
-    except Exception as e:
-        logger.warning("end_session time_decay 失败: %s", e)
-
-    # L2: 记忆巩固 — 独立容错（Levine 约束）
-    consolidated = {"merged_groups": 0, "superseded_count": 0}
-    try:
-        consolidated = do_consolidate(app.db_cog.conn, params.session_id, coll)
-    except Exception as e:
-        logger.warning("consolidate_session 失败: %s", e)
-
-    # L2: proactive recall — 独立容错（Levine 约束）
-    related = []
-    try:
-        # 取当前 session 最新记忆的 content 作为 query
-        top_row = app.db_cog.conn.execute(
-            "SELECT content FROM memories "
-            "WHERE session_id=? AND collection=? AND status='active' "
-            "ORDER BY created_at DESC LIMIT 1",
-            [params.session_id, coll],
-        ).fetchone()
-        top_content = top_row[0] if top_row else ""
-        if top_content:
-            pr_result = await do_recall(
-                query=top_content,
-                db=app.db_cog,
-                embedder=app.embedder if app.embedder.available else None,
-                collection=coll,
-                top_k=5,
-            )
-            related = [
-                m for m in pr_result.memories
-                if m.get("session_id") != params.session_id
-            ][:5]
-    except Exception as e:
-        logger.warning("proactive recall 失败: %s", e)
-
-    # L2: 记录评分
-    if params.outcome_score is not None:
-        try:
-            insert_session_outcome(app.db_cog.conn, params.session_id, params.outcome_score)
-        except Exception as e:
-            logger.warning("end_session outcome 写入失败: %s", e)
-
-    # L3: session 摘要
-    summary = get_session_summary(app.db_cog.conn, params.session_id, coll)
+        result = app.sdk.end_session(
+            session_id=session_id,
+            outcome_score=outcome_score,
+        )
+    except ValidationError as e:
+        return {"error": str(e)}
+    except DatabaseError as e:
+        return {"error": str(e)}
 
     logger.info(
         "MCP end_session: session_id=%s, memories=%d, decayed=%d, consolidated=%d",
-        params.session_id, summary.get("memory_count", 0), decayed,
-        consolidated.get("superseded_count", 0),
+        session_id,
+        result.get("summary", {}).get("memory_count", 0),
+        result.get("decayed_count", 0),
+        result.get("consolidated", {}).get("superseded_count", 0),
     )
 
-    return {
-        "status": "ended",
-        "session_id": params.session_id,
-        "summary": summary,
-        "decayed_count": decayed,
-        "consolidated": consolidated,
-        "related_memories": related,
-    }
+    return result
 
 
 # ── 入口 ──

@@ -1,0 +1,10 @@
+string description              # 必填（至少 5 字符）
+string perception_type          # 默认 "visual"
+string data                     # JSON
+string metadata                 # JSON
+string session_id               # 选填
+string collection               # 选填
+---
+bool success
+int64 memory_id
+string error

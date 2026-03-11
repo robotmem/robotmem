@@ -1,0 +1,10 @@
+string insight                  # 必填
+string context                  # 选填，JSON 字符串
+string collection               # 选填
+string session_id               # 选填
+---
+bool success
+int64 memory_id
+string status                   # "created" / "duplicate"
+string error                    # 空 = 无错误
+string auto_inferred_json       # JSON: {category, confidence, tags}

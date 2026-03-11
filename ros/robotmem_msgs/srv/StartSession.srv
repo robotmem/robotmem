@@ -1,0 +1,8 @@
+string context                  # 选填，JSON
+string collection               # 选填
+---
+bool success
+string session_id
+string collection
+int64 active_memories_count
+string error
