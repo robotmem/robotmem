@@ -93,10 +93,10 @@ class ExploreNode(Node):
 
 
 class NavNode(Node):
-    """Session 2: 沿记忆航点直线导航"""
+    """Session 2: 沿记忆航点直线导航（含超时 + 卡住跳过）"""
 
     def __init__(self, waypoints, cmd_topic="/originbot_1/cmd_vel",
-                 odom_topic="/originbot_1/odom"):
+                 odom_topic="/originbot_1/odom", timeout=60.0):
         super().__init__("nav_node")
         self.pub = self.create_publisher(Twist, cmd_topic, 10)
         self.create_subscription(Odometry, odom_topic, self._odom_cb, 10)
@@ -107,8 +107,12 @@ class NavNode(Node):
         self.pos = None
         self.yaw = 0.0
         self.t0 = time.time()
+        self.timeout = timeout
         self.positions = []
         self.done = False
+        self.wp_start_t = time.time()
+        self.wp_best_dist = float("inf")
+        self.skipped = 0
 
     def _odom_cb(self, msg):
         p = msg.pose.pose.position
@@ -120,25 +124,46 @@ class NavNode(Node):
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
 
+    def _finish(self, reason="done"):
+        self.pub.publish(Twist())
+        self.done = True
+        t = time.time() - self.t0
+        self.get_logger().info(
+            f"导航{reason}: {t:.1f}s, {self.idx}/{len(self.wps)} 航点, "
+            f"跳过 {self.skipped}")
+
     def _loop(self):
         if self.done or self.pos is None:
             return
+        # 全局超时
+        if time.time() - self.t0 > self.timeout:
+            self._finish("超时")
+            return
         if self.idx >= len(self.wps):
-            self.pub.publish(Twist())
-            self.done = True
-            t = time.time() - self.t0
-            self.get_logger().info(f"导航完成: {t:.1f}s, {self.idx} 航点")
+            self._finish("完成")
             return
 
         tx, ty = self.wps[self.idx]
         cx, cy = self.pos
-        dx, dy = tx - cx, ty - cy
-        dist = math.hypot(dx, dy)
+        dist = math.hypot(tx - cx, ty - cy)
 
         if dist < 0.3:
             self.idx += 1
+            self.wp_start_t = time.time()
+            self.wp_best_dist = float("inf")
             return
 
+        # 单航点卡住检测：5 秒没靠近就跳过
+        self.wp_best_dist = min(self.wp_best_dist, dist)
+        if time.time() - self.wp_start_t > 5.0 and dist >= self.wp_best_dist - 0.05:
+            self.get_logger().info(f"跳过航点 {self.idx}（卡住）")
+            self.skipped += 1
+            self.idx += 1
+            self.wp_start_t = time.time()
+            self.wp_best_dist = float("inf")
+            return
+
+        dy, dx = ty - cy, tx - cx
         target_yaw = math.atan2(dy, dx)
         err = target_yaw - self.yaw
         while err > math.pi:

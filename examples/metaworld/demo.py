@@ -107,11 +107,11 @@ def run_phase_on_instances(env_cls, tasks, policy_factory, episodes_per_instance
     for i, task in enumerate(tasks):
         env = env_cls()
         env.set_task(task)
-        target = env.unwrapped._target_pos.copy()
 
         try:
             for ep in range(episodes_per_instance):
                 obs_peek, _ = env.reset()
+                target = env.unwrapped._target_pos.copy()
                 obj_pos = obs_peek[4:7]
 
                 # 如果有 recall_mem，按空间检索
