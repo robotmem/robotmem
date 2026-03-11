@@ -225,9 +225,9 @@ def main():
 
             try:
                 mem.save_perception(
-                    perception_type="odometry",
-                    data={"positions": e_pos[:200], "waypoints": wps},
-                    summary=f"探索轨迹 {len(e_pos)} 点",
+                    f"探索轨迹 {len(e_pos)} 点",
+                    perception_type="proprioceptive",
+                    data=json.dumps({"positions": e_pos[:200], "waypoints": wps}),
                 )
                 print("  save_perception ✓")
             except Exception as e:
